@@ -1,0 +1,208 @@
+#include <stdexcept>
+#include <memory>
+#include "gds.h"
+#include "cufile_utils.h"
+#include "cufile.h"
+#include <cuda.h>
+#include <cuda_runtime.h>
+
+
+#include <fcntl.h>
+#include <cstring>
+#include <unistd.h>
+#include <math.h>
+
+const size_t MAX_SHADOW_BUFFER = 16 * 1024 * 1024;
+
+
+
+GDSAsyncIO::GDSAsyncIO(unsigned int n_entries, int device_id)
+{
+    // printf("Initializing the io Context\n");
+    this->max_nr = n_entries;
+    this->timeout.tv_sec = 0;
+    this->timeout.tv_nsec = 100000000;
+    check_cudaruntimecall(cudaSetDevice(device_id));
+    memset((void*)&batch_idp, 0, sizeof(CUfileBatchHandle_t));
+    CUfileError_t ret = cuFileBatchIOSetUp(&batch_idp, max_nr);
+    if (ret.err != 0 || ret.cu_err != 0) {
+        throw std::runtime_error("cuFileBatchIOSetUp failed");
+    }
+    
+}
+
+void GDSAsyncIO::register_file(int fd) {
+    this->fd = fd;
+    memset((void *)&cf_descr, 0, sizeof(CUfileDescr_t));
+    cf_descr.handle.fd = fd;
+    cf_descr.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;        
+    status = cuFileHandleRegister(&cf_handle, &cf_descr);
+    if (status.err != CU_FILE_SUCCESS) {
+            close(fd);
+            throw std::runtime_error("file register error");
+    }
+}
+
+void GDSAsyncIO::deregister_file() {
+    cuFileHandleDeregister(cf_handle);
+    close(fd);
+}
+
+GDSAsyncIO::~GDSAsyncIO()
+{
+    // printf("Closing AsyncIO context\n");
+    synchronize();
+    deregister_file();
+}
+
+void GDSAsyncIO::get_event(WaitType wt)
+{
+    std::unique_ptr<io_event> events(new io_event[this->max_nr]);
+    int num_events;
+
+    if(wt == WAIT)
+        num_events = io_getevents(io_ctx, this->min_nr, this->max_nr, events.get(), &(this->timeout)); /* 获得异步I/O event个数 */
+    else
+        num_events = io_getevents(io_ctx, 0, this->max_nr, events.get(), &(this->timeout)); /* 获得异步I/O event个数 */
+
+    for (int i = 0; i < num_events; i++) /* 开始获取每一个event并且做相应处理 */
+    {
+        struct io_event event = events.get()[i];
+        std::unique_ptr<IOData> data(static_cast<IOData *>(event.data));
+        if (data->type == WRITE)
+            this->n_write_events--;
+        else if (data->type == READ)
+            this->n_read_events--;
+        else
+            throw std::runtime_error("Unknown IO event type");
+        if (data->callback != nullptr)
+            data->callback();
+        // printf("%d tasks to be done\n", this->n_write_events);
+    }
+}
+
+void GDSAsyncIO::cuPrepareWrite(void *buffer, size_t n_bytes, unsigned long long offset, CUfileIOParams_t **iocbs, int* nr) {
+    off_t sub_offset = 0;
+    //downcast ull to off_t
+    assert(offset < ULLONG_MAX);
+    off_t off = (off_t)offset;
+
+    *nr = ceil(n_bytes / MAX_SHADOW_BUFFER);
+    *iocbs = new CUfileIOParams_t[*nr];
+    for (int i = 0; i < *nr; i++) {
+        CUfileIOParams_t *iocb = &(*iocbs)[i];
+        memset((void *)iocb, 0, sizeof(CUfileIOParams_t));
+        iocb->mode = CUFILE_BATCH;
+        iocb->u = {
+            {
+                buffer,
+                off + sub_offset,
+                sub_offset,
+                std::min(n_bytes -  sub_offset,  MAX_SHADOW_BUFFER),
+            }
+        };
+        iocb->fh = cf_handle;
+        iocb->opcode = CUFILE_WRITE;
+        sub_offset += MAX_SHADOW_BUFFER;
+    }
+}
+
+void GDSAsyncIO::cuPrepareRead(void *buffer, size_t n_bytes, unsigned long long offset, CUfileIOParams_t **iocbs, int* nr) {
+    off_t sub_offset = 0;
+    //downcast ull to off_t
+    assert(offset < ULLONG_MAX);
+    off_t off = (off_t)offset;
+
+    *nr = ceil(n_bytes / MAX_SHADOW_BUFFER);
+    *iocbs = new CUfileIOParams_t[*nr];
+    for (int i = 0; i < *nr; i++) {
+        CUfileIOParams_t *iocb = &(*iocbs)[i];
+        memset((void *)iocb, 0, sizeof(CUfileIOParams_t));
+        iocb->mode = CUFILE_BATCH;
+        iocb->u = {
+            {
+                buffer,
+                off + sub_offset,
+                sub_offset,
+                std::min(n_bytes -  sub_offset,  MAX_SHADOW_BUFFER),
+            }
+        };
+        iocb->fh = cf_handle;
+        iocb->opcode = CUFILE_READ;
+        sub_offset += MAX_SHADOW_BUFFER;
+    }
+}
+
+
+
+void GDSAsyncIO::write(int fd, void *buffer, size_t n_bytes, unsigned long long offset, callback_t callback)
+{
+    int nr;
+    CUfileIOParams_t *iocbs;
+    cuPrepareWrite(buffer, n_bytes, offset, &iocbs, &nr);
+
+    CUfileError_t ret = cuFileBatchIOSubmit(batch_idp, nr, iocbs, 0);
+
+    this->n_write_events++;
+}
+
+void GDSAsyncIO::read(int fd, void *buffer, size_t n_bytes, unsigned long long offset, callback_t callback)
+{
+    int nr;
+    CUfileIOParams_t *iocbs;
+    cuPrepareRead(buffer, n_bytes, offset, &iocbs, &nr);
+
+    CUfileError_t ret = cuFileBatchIOSubmit(batch_idp, nr, iocbs, 0);
+
+    this->n_read_events++;
+}
+
+void GDSAsyncIO::sync_write_events()
+{
+    while (this->n_write_events > 0)
+        check_cudaruntimecall(cudaStreamSynchronize(0));
+}
+
+void GDSAsyncIO::sync_read_events()
+{
+    while (this->n_read_events > 0)
+        check_cudaruntimecall(cudaStreamSynchronize(0));
+}
+
+void GDSAsyncIO::synchronize()
+{
+    while (this->n_write_events > 0 || this->n_read_events > 0)
+        check_cudaruntimecall(cudaStreamSynchronize(0));
+}
+
+void GDSAsyncIO::writev(int fd, const iovec *iov, unsigned int iovcnt, unsigned long long offset, callback_t callback)
+{
+    struct iocb iocb
+    {
+    }; //建立一个异步I/O需求
+    struct iocb *iocbs = &iocb;
+    auto *data = new IOData(WRITE, callback, iov);
+
+    io_prep_pwritev(&iocb, fd, iov, iovcnt, (long long)offset); // 初始化这个异步I/O需求 counter为偏移量
+
+    iocb.data = data;
+    io_submit(this->io_ctx, 1, &iocbs); // 提交这个I/O不会堵塞
+
+    this->n_write_events++;
+}
+
+void GDSAsyncIO::readv(int fd, const iovec *iov, unsigned int iovcnt, unsigned long long offset, callback_t callback)
+{
+    struct iocb iocb
+    {
+    }; //建立一个异步I/O需求
+    struct iocb *iocbs = &iocb;
+    auto *data = new IOData(READ, callback, iov);
+
+    io_prep_preadv(&iocb, fd, iov, iovcnt, (long long)offset);
+
+    iocb.data = data;
+    io_submit(this->io_ctx, 1, &iocbs); /* 提交这个I/O不会堵塞 */
+
+    this->n_read_events++;
+}

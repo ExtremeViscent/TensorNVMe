@@ -27,20 +27,24 @@ backend_install_dir = os.path.join(os.path.expanduser('~'), '.tensornvme')
 
 enable_uring = True
 enable_aio = True
+enable_gds = True
 if os.environ.get('DISABLE_URING') == '1' or not check_uring_compatibility():
     enable_uring = False
 if os.environ.get('DISABLE_AIO') == '1':
     enable_aio = False
-assert enable_aio or enable_uring
+if os.environ.get('DISABLE_GDS') == '1':
+    enable_gds = False
+assert enable_aio or enable_uring or enable_gds
 if os.environ.get('WITH_ROOT') == '1':
     backend_install_dir = '/usr'
     if not os.access(backend_install_dir, os.W_OK):
         raise RuntimeError(
             'Permission denied, please make sure you have root access')
 
-libraries = ['aio']
+libraries = ['aio', 'cufile', 'cuda', 'cudart']
 sources = ['csrc/offload.cpp', 'csrc/uring.cpp',
-           'csrc/aio.cpp', 'csrc/space_mgr.cpp']
+           'csrc/aio.cpp', 'csrc/space_mgr.cpp',
+           'csrc/gds.cu', 'csrc/offload_gds.cu']
 extra_objects = []
 define_macros = []
 ext_modules = []
@@ -101,6 +105,10 @@ def setup_dependencies():
         define_macros.append(('DISABLE_AIO', None))
         sources.remove('csrc/aio.cpp')
         libraries.remove('aio')
+    if not enable_gds:
+        define_macros.append(('DISABLE_GDS', None))
+        sources.remove('csrc/gds.cu')
+        sources.remove('csrc/offload_gds.cu')
     os.makedirs(build_dir, exist_ok=True)
     os.makedirs(backend_install_dir, exist_ok=True)
     os.chdir(build_dir)

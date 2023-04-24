@@ -1,7 +1,8 @@
 add_library(colo_asyncio
         OBJECT
         aio.cpp
-        uring.cpp)
+        uring.cpp
+        gds.cu)
 target_link_libraries(colo_asyncio
         PUBLIC uring
         PUBLIC aio)
