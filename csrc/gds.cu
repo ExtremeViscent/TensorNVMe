@@ -234,6 +234,7 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
     CUfileIOParams_t iocbp[num_chunks];
     batch->iocbp = iocbp;
     batch->num_chunks = num_chunks;
+    batch->devPtr = new void*[num_chunks];
     for (int i = 0; i < num_chunks; i++) {
         size_t size = i == num_chunks - 1 ? last_chunk_size : chunk_size;
         // Register buffer
@@ -251,6 +252,7 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
         iocbp[i].u.batch.devPtr_offset = 0;
         iocbp[i].u.batch.size = size;
         iocbp[i].opcode = is_write ? CUFILE_WRITE : CUFILE_READ;
+        batch->devPtr[i] = iocbp[i].u.batch.devPtr_base;
         // Pad to 4K
         pad4k(&iocbp[i]);
     }
@@ -307,40 +309,48 @@ void GDSAsyncIO::synchronize(bool is_write)
         Batch *batch = batches->front();
         int *batch_sizes = batch->batch_sizes;
         int num_mini_batches = batch->num_mini_batches;
+        int queue_depth = MAX_BATCH_IOS;
         // std::cout << "num_mini_batches: " << num_mini_batches << std::endl;
-        int pending = 0;
         for (int i = 0; i < num_mini_batches; i++) {
             // std::cout << "polling mini batch " << i << std::endl;
             // std::cout << "batch_sizes[i]: " << batch_sizes[i] << std::endl;
             if (batch_sizes[i] == 0) continue;
+            int pending = batch_sizes[i];
             CUfileIOEvents_t io_batch_events[batch_sizes[i]];
             CUfileBatchHandle_t batch_id = batch->batch_id[i];
-            uint nr=batch_sizes[i];
-            status = cuFileBatchIOGetStatus(batch_id, batch_sizes[i], &nr, io_batch_events, &(this->timeout));
+            while (pending > 0)
+            {
+                uint nr=batch_sizes[i];
+                status = cuFileBatchIOGetStatus(batch_id, batch_sizes[i], &nr, io_batch_events, &(this->timeout));
+                if (status.err != CU_FILE_SUCCESS) {
+                    throw std::runtime_error("cufile batch io get status error");
+                }
+                for (int j = 0; j < nr; j++) {
+                    CUfileStatus_t eventStatus = io_batch_events[j].status;
+                    if (eventStatus == CUFILE_COMPLETE) {
+                        pending--;
+                    }
+                    else if (eventStatus != CUFILE_PENDING) {
+                        throw std::runtime_error("cufile batch io get status error: " + std::to_string(eventStatus));
+                    }
+                }
+            }
+            // destroy batch_id
+            cuFileBatchIODestroy(batch_id);
+        }
+        // Dereigster buffer
+        for(int i = 0; i < batch->num_chunks; i++) {
+            status = cuFileBufDeregister(batch->devPtr[i]);
             if (status.err != CU_FILE_SUCCESS) {
-                throw std::runtime_error("cufile batch io get status error");
-            }
-            for (int j = 0; j < nr; j++) {
-                CUfileStatus_t eventStatus = io_batch_events[j].status;
-                if (eventStatus == CUFILE_COMPLETE) {
-                    batch_sizes[i]--;
-                }
-                else if (eventStatus == CUFILE_PENDING) {
-                    pending++;
-                }
-                else {
-                    throw std::runtime_error("cufile batch io get status error: " + std::to_string(eventStatus));
-                }
+                throw std::runtime_error("cufile buffer deregister error");
             }
         }
-        if (pending == 0) {
-            batches->pop();
-            if (batch->callback != nullptr) {
-                // std::cout << "callback" << std::endl;
-                batch->callback();
-            }
-            delete batch;
+        batches->pop();
+        if (batch->callback != nullptr) {
+            // std::cout << "callback" << std::endl;
+            batch->callback();
         }
+        delete batch;
     }
 }
 
@@ -388,7 +398,7 @@ int main()
     char* fp = tmpnam(NULL);
     int fd = open(fp, O_CREAT | O_RDWR | O_DIRECT, 0664);
     char *buf;
-    size_t n_bytes = 4 * 1000 * 1000 * 1000;
+    size_t n_bytes = 4 * 1000 * 1000;
     CUfileError_t status;
     cudaMalloc(&buf, n_bytes);
     cudaMemset(buf, 0, n_bytes);
@@ -422,6 +432,14 @@ int main()
     cudaMemset(buf, 0, n_bytes);
     gds->write(fd, buf, n_bytes, 1024, NULL);
     gds->synchronize();
+    cudaFree(buf);
+    cudaMalloc(&buf, n_bytes);
+    cudaMemset(buf, 1, n_bytes);
+    gds->read(fd, buf, n_bytes, 1024, NULL);
+    gds->synchronize();
+    int ret = 114514;
+    cudaMemcpy(&ret, buf, sizeof(int), cudaMemcpyDeviceToHost);
+    std::cout << ret << std::endl;
     close(fd);
     return 0;
 }

@@ -21,6 +21,7 @@ private:
     {
         CUfileBatchHandle_t *batch_id;
         CUfileIOParams_t *iocbp;
+        void **devPtr;
         int *batch_sizes;
         int num_chunks;
         int num_mini_batches;
