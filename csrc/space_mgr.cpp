@@ -14,6 +14,9 @@ ull SpaceManager::alloc(ull bytes)
 {
     if (bytes == 0)
         throw std::runtime_error("Invalid alloc size (0)");
+    // Pad to 4K-aligned
+    if (bytes % 4096 != 0)
+        bytes += 4096 - bytes % 4096;
     auto target_iter = avail_spaces.end();
     ull target_bytes = 0;
     for (auto iter = avail_spaces.begin(); iter != avail_spaces.end(); iter++)

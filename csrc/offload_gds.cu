@@ -24,14 +24,14 @@
 //     }
 //     return iovs;
 // }
-std::unordered_set<std::string> get_backends()
+std::unordered_set<std::string> GDSOffloader::get_backends()
 {
     std::unordered_set<std::string> backends;
     backends.insert("gds");
     return backends;
 }
 
-void probe_asyncio(const std::string &backend)
+void GDSOffloader::probe_asyncio(const std::string &backend)
 {
     FILE *fp = tmpfile();
     if (!fp)
@@ -88,7 +88,7 @@ void probe_asyncio(const std::string &backend)
     }
 }
 
-bool probe_backend(const std::string &backend)
+bool GDSOffloader::probe_backend(const std::string &backend)
 {
     std::unordered_set<std::string> backends = get_backends();
     if (backends.find(backend) == backends.end())
@@ -104,7 +104,7 @@ bool probe_backend(const std::string &backend)
     }
 }
 
-AsyncIO *create_asyncio(unsigned int n_entries, const std::string &backend)
+AsyncIO *GDSOffloader::create_asyncio(unsigned int n_entries, const std::string &backend)
 {
     if (!probe_backend(nullptr))
         throw std::runtime_error("Backend \"" + backend + "\" is not install correctly");
@@ -303,6 +303,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         // .def("async_readv", &GDSOffloader::async_readv, py::arg("tensors"), py::arg("key"), py::arg("callback") = py::none())
         // .def("sync_writev", &GDSOffloader::sync_writev, py::arg("tensors"), py::arg("key"))
         // .def("sync_readv", &GDSOffloader::sync_readv, py::arg("tensors"), py::arg("key"));
-    m.def("get_backends", get_backends);
-    m.def("probe_backend", probe_backend, py::arg("backend"));
+    // m.def("get_backends", get_backends);
+    // m.def("probe_backend", probe_backend, py::arg("backend"));
 }

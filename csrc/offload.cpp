@@ -34,17 +34,21 @@ std::unordered_set<std::string> get_backends()
 #ifndef DISABLE_AIO
     backends.insert("aio");
 #endif
+#ifndef DISABLE_GDS
+    backends.insert("gds");
+#endif
     return backends;
 }
 
 void probe_asyncio(const std::string &backend)
 {
-    FILE *fp = tmpfile();
+    char* fp = tmpnam(nullptr);
     if (!fp)
     {
         printf("Create tmpfile error: %s\n", strerror(errno));
         throw std::runtime_error("uring probe failed\n");
     }
+    printf("tmpfile: %s\n", fp);
     try
     {
         std::unique_ptr<AsyncIO> aio;
@@ -54,35 +58,72 @@ void probe_asyncio(const std::string &backend)
 #else
             throw std::runtime_error("backend is not installed\n");
 #endif
-        else
+        else if (backend == "aio")
 #ifndef DISABLE_AIO
             aio.reset(new AIOAsyncIO(2));
 #else
             throw std::runtime_error("backend is not installed\n");
 #endif
-
-        int fd = fileno(fp);
-        const int n_loop = 5, n_len = 18;
+        else if (backend == "gds")
+#ifndef DISABLE_GDS
+    aio.reset(new GDSAsyncIO(128));
+#else
+    throw std::runtime_error("GDS is not installed\n");
+#endif
+        else
+            throw std::runtime_error("Invalid backend\n");
+        std::cout<< "opening file: " << fp << std::endl;
+        int fd = open(fp, O_CREAT | O_RDWR | O_DIRECT, 0664);
+        if (fd < 0)
+        {
+            printf("Open tmpfile error: %s\n", strerror(errno));
+            throw std::runtime_error("uring probe failed\n");
+        }
+        const int n_loop = 5, n_len = 4096;
 
         char text[n_loop][n_len];
+        void *devPtr[n_loop];
+        
+        {
+            for (int i = 0; i < n_loop; i++){
+                cudaMalloc(&devPtr[i], n_len * sizeof(char));
+                cudaMemset(devPtr[i], 'V', n_len * sizeof(char));
+                std::cout << "&devPtr: " << &devPtr[i] << std::endl;
+                std::cout << "devPtr: " << devPtr[i] << std::endl;
+            }
+        }
 
         int offset = 0;
         size_t len;
         for (int i = 0; i < n_loop; i++)
         {
             len = n_len;
-            aio->write(fd, text[i], len, offset, nullptr);
+            aio->write(fd, backend == "gds" ? devPtr[i] : text[i], len, offset, nullptr);
             offset += len;
         }
         aio->sync_write_events();
 
+        std::cout << "sync_write_events" << std::endl;
         char new_text[n_loop][n_len];
+        void *new_devPtr[n_loop];
+        if (backend == "gds")
+        {
+            for (int i = 0; i < n_loop; i++){
+                cudaMalloc(&new_devPtr[i], n_len * sizeof(char));
+            }
+        }
         offset = 0;
         for (int i = 0; i < n_loop; i++)
         {
             len = n_len;
-            aio->read(fd, new_text[i], len, offset, nullptr);
+            aio->read(fd, backend == "gds" ? new_devPtr[i] : new_text[i], len, offset, nullptr);
             offset += len;
+        }
+        if (backend == "gds")
+        {
+            for (int i = 0; i < n_loop; i++){
+                cudaMemcpy(new_text[i], new_devPtr[i], n_len * sizeof(char), cudaMemcpyDeviceToHost);
+            }
         }
         aio->sync_read_events();
         for (int i = 0; i < n_loop; i++)
@@ -92,12 +133,12 @@ void probe_asyncio(const std::string &backend)
                 assert(text[i][j] == new_text[i][j]);
             }
         }
-        fclose(fp);
+        close(fd);
     }
     catch (...)
     {
-        fclose(fp);
-        throw std::runtime_error("uring probe failed\n");
+        // close(fd);
+        throw std::runtime_error("probe failed\n");
     }
 }
 
@@ -134,19 +175,24 @@ AsyncIO *create_asyncio(unsigned int n_entries, const std::string &backend)
     if (backend == "aio")
         return new AIOAsyncIO(n_entries);
 #endif
+#ifndef DISABLE_GDS
+    if (backend == "gds")
+        return new GDSAsyncIO(n_entries);
+#endif
     throw std::runtime_error("Unsupported backend: " + backend);
 }
 
 Offloader::Offloader(const std::string &filename, unsigned int n_entries, const std::string &backend) : filename(filename), space_mgr(SpaceManager(0))
 {
     this->aio = create_asyncio(n_entries, backend);
-    this->fd = open(filename.c_str(), O_RDWR | O_CREAT, S_IRUSR | S_IWUSR);
+    if (backend == "gds") gds_enabled = true;
+    this->fd = open(filename.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0664);
     this->aio->register_file(fd);
 }
 
 SpaceInfo Offloader::prepare_write(const at::Tensor &tensor, const std::string &key)
 {
-    if (!tensor.is_contiguous() || !tensor.is_cpu())
+    if (!tensor.is_contiguous() || gds_enabled ? !tensor.is_cuda(): !tensor.is_cpu())
         throw std::runtime_error("Tensor must be contiguous and on cpu");
     ull bytes = tensor.storage().nbytes();
     ull offset = this->space_mgr.alloc(bytes);
@@ -157,7 +203,7 @@ SpaceInfo Offloader::prepare_write(const at::Tensor &tensor, const std::string &
 
 SpaceInfo Offloader::prepare_read(const at::Tensor &tensor, const std::string &key)
 {
-    if (!tensor.is_contiguous() || !tensor.is_cpu())
+    if (!tensor.is_contiguous() || gds_enabled ? !tensor.is_cuda(): !tensor.is_cpu())
         throw std::runtime_error("Tensor must be contiguous and on cpu");
     if (this->tensors_info.find(key) == this->tensors_info.end())
         throw std::runtime_error("Read error, tensor not found");
@@ -311,6 +357,89 @@ void Offloader::release(ull offset, ull bytes, callback_t callback)
         callback();
 }
 
+GDSOffloader::GDSOffloader(const std::string &filename, unsigned int n_entries, const std::string &backend) : filename(filename), space_mgr(SpaceManager(0))
+{
+    this->aio = create_asyncio(n_entries, backend);
+    this->fd = open(filename.c_str(), O_CREAT | O_RDWR | O_DIRECT, 0664);
+    this->aio->register_file(fd);
+}
+
+SpaceInfo GDSOffloader::prepare_write(const at::Tensor &tensor, const std::string &key)
+{
+    if (!tensor.is_contiguous() || !tensor.is_cuda())
+        throw std::runtime_error("Tensor must be contiguous and on gpu");
+    ull bytes = tensor.storage().nbytes();
+    ull offset = this->space_mgr.alloc(bytes);
+    SpaceInfo space_info(offset, bytes);
+    this->tensors_info[key] = space_info;
+    return space_info;
+}
+
+SpaceInfo GDSOffloader::prepare_read(const at::Tensor &tensor, const std::string &key)
+{
+    if (!tensor.is_contiguous() || !tensor.is_cuda())
+        throw std::runtime_error("Tensor must be contiguous and on gpu");
+    if (this->tensors_info.find(key) == this->tensors_info.end())
+        throw std::runtime_error("Read error, tensor not found");
+    ull bytes = tensor.storage().nbytes();
+    SpaceInfo space_info = this->tensors_info[key];
+    if (bytes != space_info.second)
+        throw std::runtime_error("Read error, tensor shape mismatch");
+    this->tensors_info.erase(key);
+    return space_info;
+}
+
+void GDSOffloader::async_write(const at::Tensor &tensor, const std::string &key, callback_t callback)
+{
+    ull offset, bytes;
+    std::tie(offset, bytes) = prepare_write(tensor, key);
+    this->aio->write(this->fd, tensor.data_ptr(), bytes, offset, callback);
+
+    this->aio->get_event(NOWAIT);
+}
+
+void GDSOffloader::async_read(const at::Tensor &tensor, const std::string &key, callback_t callback)
+{
+    ull offset, bytes;
+    std::tie(offset, bytes) = prepare_read(tensor, key);
+    auto fn = std::bind(&GDSOffloader::release, this, offset, bytes, callback);
+    this->aio->read(this->fd, tensor.data_ptr(), bytes, offset, fn);
+
+    this->aio->get_event(NOWAIT);
+}
+
+
+void GDSOffloader::sync_write_events()
+{
+    this->aio->sync_write_events();
+}
+
+void GDSOffloader::sync_read_events()
+{
+    this->aio->sync_read_events();
+}
+
+void GDSOffloader::synchronize()
+{
+    this->aio->synchronize();
+}
+
+GDSOffloader::~GDSOffloader()
+{
+    errno = 0;
+    delete this->aio;
+    close(this->fd);
+    if (remove(this->filename.c_str()) != 0)
+        printf("Remove \"%s\" error(%d): %s\n", this->filename.c_str(), errno, strerror(errno));
+}
+
+void GDSOffloader::release(ull offset, ull bytes, callback_t callback)
+{
+    this->space_mgr.free(offset, bytes);
+    if (callback != nullptr)
+        callback();
+}
+
 namespace py = pybind11;
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
@@ -328,6 +457,15 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
         .def("async_readv", &Offloader::async_readv, py::arg("tensors"), py::arg("key"), py::arg("callback") = py::none())
         .def("sync_writev", &Offloader::sync_writev, py::arg("tensors"), py::arg("key"))
         .def("sync_readv", &Offloader::sync_readv, py::arg("tensors"), py::arg("key"));
+    py::class_<GDSOffloader>(m, "GDSOffloader")
+        .def(py::init<const std::string &, unsigned int, const std::string &>(), py::arg("filename"), py::arg("n_entries"), py::arg("backend") = "gds")
+        .def("async_write", &GDSOffloader::async_write, py::arg("tensor"), py::arg("key"), py::arg("callback") = py::none())
+        .def("async_read", &GDSOffloader::async_read, py::arg("tensor"), py::arg("key"), py::arg("callback") = py::none())
+        // .def("sync_write", &GDSOffloader::sync_write, py::arg("tensor"), py::arg("key"))
+        // .def("sync_read", &GDSOffloader::sync_read, py::arg("tensor"), py::arg("key"))
+        .def("sync_write_events", &GDSOffloader::sync_write_events)
+        .def("sync_read_events", &GDSOffloader::sync_write_events)
+        .def("synchronize", &GDSOffloader::synchronize);
     m.def("get_backends", get_backends);
     m.def("probe_backend", probe_backend, py::arg("backend"));
 }

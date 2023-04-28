@@ -44,7 +44,7 @@ if os.environ.get('WITH_ROOT') == '1':
 libraries = ['aio', 'cufile', 'cuda', 'cudart']
 sources = ['csrc/offload.cpp', 'csrc/uring.cpp',
            'csrc/aio.cpp', 'csrc/space_mgr.cpp',
-           'csrc/gds.cu', 'csrc/offload_gds.cu']
+           'csrc/gds.cu']
 extra_objects = []
 define_macros = []
 ext_modules = []
@@ -108,7 +108,6 @@ def setup_dependencies():
     if not enable_gds:
         define_macros.append(('DISABLE_GDS', None))
         sources.remove('csrc/gds.cu')
-        sources.remove('csrc/offload_gds.cu')
     os.makedirs(build_dir, exist_ok=True)
     os.makedirs(backend_install_dir, exist_ok=True)
     os.chdir(build_dir)

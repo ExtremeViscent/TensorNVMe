@@ -17,6 +17,10 @@ public:
     void sync_write_events();
     void sync_read_events();
     void synchronize();
+    std::unordered_set<std::string> get_backends(); 
+    void probe_asyncio(const std::string &backend);
+    bool probe_backend(const std::string &backend);
+    AsyncIO *create_asyncio(unsigned int n_entries, const std::string &backend);
     ~GDSOffloader();
     // SpaceInfo prepare_writev(const std::vector<at::Tensor> &tensors, const std::string &key);
     // SpaceInfo prepare_readv(const std::vector<at::Tensor> &tensors, const std::string &key);
