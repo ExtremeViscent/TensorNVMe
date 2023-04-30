@@ -88,8 +88,6 @@ void probe_asyncio(const std::string &backend)
             for (int i = 0; i < n_loop; i++){
                 cudaMalloc(&devPtr[i], n_len * sizeof(char));
                 cudaMemset(devPtr[i], 'V', n_len * sizeof(char));
-                std::cout << "&devPtr: " << &devPtr[i] << std::endl;
-                std::cout << "devPtr: " << devPtr[i] << std::endl;
             }
         }
 
