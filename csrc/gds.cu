@@ -44,12 +44,49 @@ void GDSAsyncIO::init_driver(){
 	if (status.err != CU_FILE_SUCCESS) {
 		throw std::runtime_error("cufile driver set max direct io size error");
 	}
+
+    // Register buffer
+    // status = cuFileBufRegister(
+    //     devPtr, 
+    //     n_bytes, 0);
+    // if (status.err != CU_FILE_SUCCESS) {
+    //     std::cerr << "cuFileBufRegister failed" << std::endl;
+    // }
+    int num_buffers = 128;
+    for (int i = 0; i < num_buffers; i++){
+        void *buffer;
+        size_t n_bytes = MAX_BUFFER_SIZE;
+        check_cudaruntimecall(cudaMalloc(&buffer, n_bytes));
+        check_cudaruntimecall(cudaMemset(buffer, 0, n_bytes));
+        status = cuFileBufRegister(
+            buffer, 
+            n_bytes, 0);
+        if (status.err != CU_FILE_SUCCESS) {
+            std::cerr << "cuFileBufRegister failed" << std::endl;
+        }
+        avail_buffers.push(buffer);
+    }
 }
 
 
 GDSAsyncIO::~GDSAsyncIO()
 {
     synchronize();
+    // Destroy batch io
+    while (!avail_batch_ids.empty())
+    {
+        CUfileBatchHandle_t batch_id = avail_batch_ids.top();
+        cuFileBatchIODestroy(batch_id);
+        avail_batch_ids.pop();
+    }
+    
+    // Deregsiter buffer
+    while (!avail_buffers.empty())
+    {
+        cuFileBufDeregister(avail_buffers.top());
+        avail_buffers.pop();
+    }
+    
     // Close driver
     status = cuFileDriverClose();
     if (status.err != CU_FILE_SUCCESS) {
@@ -175,16 +212,17 @@ void GDSAsyncIO::pad4k(CUfileIOParams_t *iocbp){
     void *new_devPtr = (void *)((char *)devPtr + size);
     size_t padding_size = new_size - size;
     cudaMalloc(&new_devPtr, new_size);
-    cudaMemcpy(new_devPtr, devPtr, size, cudaMemcpyDeviceToDevice);
-    cudaMemset((void *)((char *)new_devPtr + size), 0, padding_size);
+    // cudaMemset((void *)((char *)new_devPtr + size), 0, padding_size);
+    if (iocbp->opcode == CUFILE_WRITE)
+        cudaMemcpy(new_devPtr, devPtr, size, cudaMemcpyDeviceToHost);
     iocbp->u.batch.devPtr_base = new_devPtr;
     iocbp->u.batch.devPtr_offset = 0;
-    iocbp->u.batch.size = new_size;
+    // iocbp->u.batch.size = new_size;
     // Update buffer
-    status = cuFileBufRegister(new_devPtr, new_size, 0);
-    if (status.err != CU_FILE_SUCCESS) {
-        // std::cerr << "cuFileBufRegister failed" << std::endl;
-    }
+    // status = cuFileBufRegister(new_devPtr, new_size, 0);
+    // if (status.err != CU_FILE_SUCCESS) {
+    //     // std::cerr << "cuFileBufRegister failed" << std::endl;
+    // }
 }
 
 void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long long offset, callback_t callback, bool is_write)
@@ -193,8 +231,22 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
     batch->callback = callback;
     // Split tensor into chunks
     size_t chunk_size = MAX_BUFFER_SIZE;
-    int num_chunks = n_bytes / chunk_size;
+    int num_chunks = n_bytes / chunk_size;    // int num_buffers = 128;
+    // for (int i = 0; i < num_buffers; i++){
+    //     void *buffer;
+    //     size_t n_bytes = MAX_BUFFER_SIZE;
+    //     check_cudaruntimecall(cudaMalloc(&buffer, n_bytes));
+    //     check_cudaruntimecall(cudaMemset(buffer, 0, n_bytes));
+    //     status = cuFileBufRegister(
+    //         buffer, 
+    //         n_bytes, 0);
+    //     if (status.err != CU_FILE_SUCCESS) {
+    //         std::cerr << "cuFileBufRegister failed" << std::endl;
+    //     }
+    //     avail_buffers.push(buffer);
+    // }
     int last_chunk_size = n_bytes % chunk_size;
+    batch->n_bytes = n_bytes;
 
     // std::cout << n_bytes / MAX_BUFFER_SIZE << std::endl;
 
@@ -233,28 +285,30 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
     // Prepare batch IO control block
     CUfileIOParams_t iocbp[num_chunks];
     batch->iocbp = iocbp;
+    batch->buffers = new void*[num_chunks];
     batch->num_chunks = num_chunks;
-    batch->devPtr = new void*[num_chunks];
+    batch->devPtr = devPtr;
     for (int i = 0; i < num_chunks; i++) {
         size_t size = i == num_chunks - 1 ? last_chunk_size : chunk_size;
-        // Register buffer
-        status = cuFileBufRegister(
-            devPtr + i * chunk_size, 
-            size, 0);
-        if (status.err != CU_FILE_SUCCESS) {
-            // std::cerr << "cuFileBufRegister failed" << std::endl;
+        // Copy to buffer
+        assert(!avail_buffers.empty());
+        void *buffer = avail_buffers.top();
+        avail_buffers.pop();
+        if (is_write) {
+            cudaMemcpy(buffer, devPtr + i * chunk_size, size, cudaMemcpyDefault);
         }
         // Prepare IO control block
         iocbp[i].mode = CUFILE_BATCH;
         iocbp[i].fh = cf_handle;
-        iocbp[i].u.batch.devPtr_base = devPtr + i * chunk_size;
+        iocbp[i].u.batch.devPtr_base = buffer;
         iocbp[i].u.batch.file_offset = file_offset + i * chunk_size;
         iocbp[i].u.batch.devPtr_offset = 0;
-        iocbp[i].u.batch.size = size;
+        iocbp[i].u.batch.size = chunk_size;
         iocbp[i].opcode = is_write ? CUFILE_WRITE : CUFILE_READ;
-        batch->devPtr[i] = iocbp[i].u.batch.devPtr_base;
+        iocbp[i].cookie = nullptr;
+        batch->buffers[i] = buffer;
         // Pad to 4K
-        pad4k(&iocbp[i]);
+        // pad4k(&iocbp[i]);
     }
 
     // Submit batch IO
@@ -271,7 +325,12 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
         CUfileIOParams_t *mini_batch;
         mini_batch = &iocbp[i];
         CUfileBatchHandle_t batch_id;
-        cu_batchio_setup(&batch_id, nr);
+        if (!avail_batch_ids.empty()) {
+            batch_id = avail_batch_ids.top();
+            avail_batch_ids.pop();
+        } else {
+            cu_batchio_setup(&batch_id, nr);
+        }
         cu_batchio_submit(batch_id, mini_batch, nr);
         batch->batch_id[i] = batch_id;
     }
@@ -303,7 +362,7 @@ void GDSAsyncIO::sync_read_events()
 }
 
 void GDSAsyncIO::synchronize(bool is_write)
-{
+{   
     std::queue<Batch *> *batches = is_write ? &batches_w : &batches_r;
     while (!batches->empty()){
         Batch *batch = batches->front();
@@ -325,26 +384,31 @@ void GDSAsyncIO::synchronize(bool is_write)
                 if (status.err != CU_FILE_SUCCESS) {
                     throw std::runtime_error("cufile batch io get status error");
                 }
-                for (int j = 0; j < nr; j++) {
-                    CUfileStatus_t eventStatus = io_batch_events[j].status;
-                    if (eventStatus == CUFILE_COMPLETE) {
-                        pending--;
-                    }
-                    else if (eventStatus != CUFILE_PENDING) {
-                        throw std::runtime_error("cufile batch io get status error: " + std::to_string(eventStatus));
-                    }
+                pending -= nr;
+            }
+            // return batch_id to pool
+            avail_batch_ids.push(batch_id);
+        }
+        // Transfer buffers back
+        {
+            size_t chunk_size = MAX_BUFFER_SIZE;
+            int num_chunks = batch->num_chunks;
+            size_t last_chunk_size = batch->n_bytes % chunk_size;
+            CUfileIOParams_t *iocbp = batch->iocbp;
+            void **buffers = batch->buffers;
+            for (int i = 0; i < num_chunks; i++)
+            {
+                size_t size = i == num_chunks - 1 ? last_chunk_size : chunk_size;
+                void *src = buffers[i];
+                if (!is_write)
+                {
+                    void *dst = batch->devPtr + i * chunk_size;
+                    cudaMemcpy(dst, src, size, cudaMemcpyDeviceToDevice);
                 }
-            }
-            // destroy batch_id
-            cuFileBatchIODestroy(batch_id);
-        }
-        // Dereigster buffer
-        for(int i = 0; i < batch->num_chunks; i++) {
-            status = cuFileBufDeregister(batch->devPtr[i]);
-            if (status.err != CU_FILE_SUCCESS) {
-                throw std::runtime_error("cufile buffer deregister error");
+                avail_buffers.push(src);
             }
         }
+
         batches->pop();
         if (batch->callback != nullptr) {
             // std::cout << "callback" << std::endl;
@@ -394,14 +458,24 @@ void GDSAsyncIO::readv(int fd, const iovec *iov, unsigned int iovcnt, unsigned l
 
 int main()
 {
+    cudaSetDevice(1);
     GDSAsyncIO *gds = new GDSAsyncIO(128);
     char* fp = tmpnam(NULL);
+    fp = "./gds_test.bin";
+    char* fp2 = "./gds_ret.bin";
+    char* fp3 = "./gds_in.bin";
     int fd = open(fp, O_CREAT | O_RDWR | O_DIRECT, 0664);
+    int fd2 = open(fp2, O_CREAT | O_RDWR, 0664);
+    int fd3 = open(fp3, O_CREAT | O_RDWR, 0664);
     char *buf;
     size_t n_bytes = 4 * 1000 * 1000;
     CUfileError_t status;
-    cudaMalloc(&buf, n_bytes);
-    cudaMemset(buf, 0, n_bytes);
+    void *input = malloc(2 * n_bytes);
+    memset(input, 114, n_bytes);
+    memset(input + n_bytes, 514, n_bytes);
+    write(fd3, input, 2 * n_bytes);
+    cudaMalloc(&buf, 2 * n_bytes);
+    cudaMemcpy(buf, input, 2 * n_bytes, cudaMemcpyHostToDevice);
     // status = cuFileBufRegister(buf, 4096, 0);
     // if (status.err != CU_FILE_SUCCESS) {
     //     throw std::runtime_error("cufile buf register error");
@@ -427,19 +501,20 @@ int main()
     // cuFileBufDeregister(buf);
 
     gds->write(fd, buf, n_bytes, 0, NULL);
-    // gds->synchronize();
-    cudaMalloc(&buf, n_bytes);
-    cudaMemset(buf, 0, n_bytes);
-    gds->write(fd, buf, n_bytes, 1024, NULL);
+    gds->write(fd, buf + n_bytes, n_bytes, n_bytes, NULL);
     gds->synchronize();
     cudaFree(buf);
-    cudaMalloc(&buf, n_bytes);
-    cudaMemset(buf, 1, n_bytes);
-    gds->read(fd, buf, n_bytes, 1024, NULL);
+    cudaMalloc(&buf, 2 * n_bytes);
+    cudaMemset(buf, 1, 2 * n_bytes);
+    gds->read(fd, buf, n_bytes, 0, NULL);
+    gds->read(fd, buf + n_bytes, n_bytes, n_bytes, NULL);
     gds->synchronize();
-    int ret = 114514;
-    cudaMemcpy(&ret, buf, sizeof(int), cudaMemcpyDeviceToHost);
-    std::cout << ret << std::endl;
+    char* ret = (char*)malloc(2 * n_bytes);
+    cudaMemcpy(ret, buf, n_bytes, cudaMemcpyDeviceToHost);
+    cudaMemcpy(ret + n_bytes, buf + n_bytes, n_bytes, cudaMemcpyDeviceToHost);
+    write(fd2, ret, 2 * n_bytes);
     close(fd);
+    close(fd2);
+    close(fd3);
     return 0;
 }
