@@ -3,6 +3,7 @@
 #include "gds.h"
 #include "cufile_utils.h"
 #include "cufile.h"
+#include "nvToolsExt.h"
 
 GDSAsyncIO::GDSAsyncIO(unsigned int n_entries)
 {
@@ -52,7 +53,7 @@ void GDSAsyncIO::init_driver(){
     // if (status.err != CU_FILE_SUCCESS) {
     //     std::cerr << "cuFileBufRegister failed" << std::endl;
     // }
-    int num_buffers = 128;
+    int num_buffers = 128/16;
     for (int i = 0; i < num_buffers; i++){
         void *buffer;
         size_t n_bytes = MAX_BUFFER_SIZE;
@@ -187,6 +188,7 @@ void GDSAsyncIO::cu_batchio_submit(CUfileBatchHandle_t batch_id, CUfileIOParams_
     //         std::cerr << "cuFileBufRegister failed" << std::endl;
     //     }
     // }
+    nvtxRangePushA("cuFileBatchIOSubmit");
     status = cuFileBatchIOSubmit(batch_id, nr, iocbp, 0);
     // std::cout << "submitting " << nr << " iocbp" << std::endl;
 
@@ -201,6 +203,7 @@ void GDSAsyncIO::cu_batchio_submit(CUfileBatchHandle_t batch_id, CUfileIOParams_
     // std::cout << "submitted" << std::endl;
     void *cookie = iocbp[0].cookie;
     // std::cout << "cookie: " << cookie << std::endl;
+    nvtxRangePop();
 }
 
 void GDSAsyncIO::pad4k(CUfileIOParams_t *iocbp){
@@ -227,6 +230,7 @@ void GDSAsyncIO::pad4k(CUfileIOParams_t *iocbp){
 
 void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long long offset, callback_t callback, bool is_write)
 {
+    nvtxRangePushA("operate");
     Batch *batch = new Batch();
     batch->callback = callback;
     // Split tensor into chunks
@@ -340,6 +344,7 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
     else {
         batches_r.push(batch);
     }
+    nvtxRangePop();
 }
 void GDSAsyncIO::write(int fd, void *devPtr, size_t n_bytes, unsigned long long offset, callback_t callback)
 {
@@ -363,6 +368,7 @@ void GDSAsyncIO::sync_read_events()
 
 void GDSAsyncIO::synchronize(bool is_write)
 {   
+    nvtxRangePushA("synchronize");
     std::queue<Batch *> *batches = is_write ? &batches_w : &batches_r;
     while (!batches->empty()){
         Batch *batch = batches->front();
@@ -377,14 +383,18 @@ void GDSAsyncIO::synchronize(bool is_write)
             int pending = batch_sizes[i];
             CUfileIOEvents_t io_batch_events[batch_sizes[i]];
             CUfileBatchHandle_t batch_id = batch->batch_id[i];
-            while (pending > 0)
+            int timeout = 1000;
+            while (pending > 0 && timeout > 0)
             {
+                nvtxRangePushA("polling");
                 uint nr=batch_sizes[i];
                 status = cuFileBatchIOGetStatus(batch_id, batch_sizes[i], &nr, io_batch_events, &(this->timeout));
                 if (status.err != CU_FILE_SUCCESS) {
                     throw std::runtime_error("cufile batch io get status error");
                 }
                 pending -= nr;
+                timeout--;
+                nvtxRangePop();
             }
             // return batch_id to pool
             avail_batch_ids.push(batch_id);
@@ -416,6 +426,7 @@ void GDSAsyncIO::synchronize(bool is_write)
         }
         delete batch;
     }
+    nvtxRangePop();
 }
 
 void GDSAsyncIO::synchronize()
@@ -456,14 +467,12 @@ void GDSAsyncIO::readv(int fd, const iovec *iov, unsigned int iovcnt, unsigned l
     // this->n_read_events++;
 }
 
-int main()
-{
-    cudaSetDevice(1);
+void rw_verified(){
     GDSAsyncIO *gds = new GDSAsyncIO(128);
-    char* fp = tmpnam(NULL);
+    char *fp = tmpnam(NULL);
     fp = "./gds_test.bin";
-    char* fp2 = "./gds_ret.bin";
-    char* fp3 = "./gds_in.bin";
+    char *fp2 = "./gds_ret.bin";
+    char *fp3 = "./gds_in.bin";
     int fd = open(fp, O_CREAT | O_RDWR | O_DIRECT, 0664);
     int fd2 = open(fp2, O_CREAT | O_RDWR, 0664);
     int fd3 = open(fp3, O_CREAT | O_RDWR, 0664);
@@ -476,29 +485,6 @@ int main()
     write(fd3, input, 2 * n_bytes);
     cudaMalloc(&buf, 2 * n_bytes);
     cudaMemcpy(buf, input, 2 * n_bytes, cudaMemcpyHostToDevice);
-    // status = cuFileBufRegister(buf, 4096, 0);
-    // if (status.err != CU_FILE_SUCCESS) {
-    //     throw std::runtime_error("cufile buf register error");
-    // }
-    // CUfileIOParams_t io_batch_params;
-    // CUfileHandle_t cf_handle;
-    // gds->register_file(fd, &cf_handle);
-    // io_batch_params.mode = CUFILE_BATCH;
-    // io_batch_params.fh = cf_handle;
-    // io_batch_params.u.batch.devPtr_base = buf;
-    // io_batch_params.u.batch.file_offset = 0;
-    // io_batch_params.u.batch.devPtr_offset = 0;
-    // io_batch_params.u.batch.size = 4096;
-    // io_batch_params.opcode = CUFILE_WRITE;
-    // CUfileBatchHandle_t batch_id;
-    // gds->cu_batchio_setup(&batch_id, 1);
-    // gds->cu_batchio_submit(batch_id, &io_batch_params, 1);
-    // // status = cuFileBatchIOSubmit(batch_id, 1, &io_batch_params, 0);
-    // if(status.err != 0) {
-    //     throw std::runtime_error("cuFileBatchIOSubmit failed");
-    // }
-    // std::cout << "write" << std::endl;
-    // cuFileBufDeregister(buf);
 
     gds->write(fd, buf, n_bytes, 0, NULL);
     gds->write(fd, buf + n_bytes, n_bytes, n_bytes, NULL);
@@ -509,12 +495,34 @@ int main()
     gds->read(fd, buf, n_bytes, 0, NULL);
     gds->read(fd, buf + n_bytes, n_bytes, n_bytes, NULL);
     gds->synchronize();
-    char* ret = (char*)malloc(2 * n_bytes);
+    char *ret = (char *)malloc(2 * n_bytes);
     cudaMemcpy(ret, buf, n_bytes, cudaMemcpyDeviceToHost);
     cudaMemcpy(ret + n_bytes, buf + n_bytes, n_bytes, cudaMemcpyDeviceToHost);
     write(fd2, ret, 2 * n_bytes);
     close(fd);
     close(fd2);
     close(fd3);
+}
+
+void w_only(){
+    GDSAsyncIO *gds = new GDSAsyncIO(128);
+    char *fp = tmpnam(NULL);
+    fp = "/data/gds_test.bin";
+    int fd = open(fp, O_CREAT | O_RDWR | O_DIRECT, 0664);
+    size_t n_bytes = 4 * 1000 * 1000;
+    void *devPtr;
+    cudaMalloc(&devPtr, n_bytes);
+    cudaMemset(devPtr, 1, n_bytes);
+    gds->write(fd, devPtr, n_bytes, 0, NULL);
+    gds->synchronize();
+    cudaFree(devPtr);
+}
+
+int main()
+{
+    cudaSetDevice(1);
+    rw_verified();
+    
+
     return 0;
 }
