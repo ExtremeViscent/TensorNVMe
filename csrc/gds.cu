@@ -53,7 +53,7 @@ void GDSAsyncIO::init_driver(){
     // if (status.err != CU_FILE_SUCCESS) {
     //     std::cerr << "cuFileBufRegister failed" << std::endl;
     // }
-    int num_buffers = 128/16;
+    int num_buffers = 128;
     for (int i = 0; i < num_buffers; i++){
         void *buffer;
         size_t n_bytes = MAX_BUFFER_SIZE;
