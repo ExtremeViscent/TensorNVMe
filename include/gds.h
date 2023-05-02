@@ -14,7 +14,7 @@
 
 #define MAX_DIO_SIZE 16384
 #define MAX_BATCH_IOS 128
-#define MAX_BUFFER_SIZE (size_t) 16 * 1024 * 1024 // Shadow buffer size
+#define MAX_BUFFER_SIZE (size_t) 1024 * 1024 // Shadow buffer size
 #define BAR_SIZE 256 * 1024 * 1024 // 256MB for V100, VRAM size for A100
 
 class GDSAsyncIO : public AsyncIO
