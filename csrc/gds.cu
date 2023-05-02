@@ -321,6 +321,24 @@ void GDSAsyncIO::operate(int fd, void *devPtr, size_t n_bytes, unsigned long lon
     // std::cout << "num_mini_batches: " << batch->num_mini_batches << std::endl;
     batch->batch_sizes = new int[batch->num_mini_batches];
     batch->batch_id = new CUfileBatchHandle_t[batch->num_mini_batches];
+    // Write synchronized
+    for (int i = 0; i < batch->num_chunks; i ++){
+        void *buffer = batch->iocbp[i].u.batch.devPtr_base;
+        void *devPtr = batch->devPtr;
+        size_t size = i == num_chunks - 1 ? last_chunk_size : chunk_size;
+        off_t file_offset = batch->iocbp[i].u.batch.file_offset;
+        if (is_write) {
+            cuFileWrite(cf_handle, buffer, chunk_size, file_offset, 0);
+            avail_buffers.push(buffer);
+        }
+        else {
+            cuFileRead(cf_handle, buffer, chunk_size, file_offset, 0);
+            // Transfer buffers back
+            cudaMemcpy(devPtr + i * chunk_size, buffer, size, cudaMemcpyDefault);
+            avail_buffers.push(buffer);
+        }
+    }
+    return;
     // print_metedata(iocbp[0]);
     for (int i = 0; i < batch->num_mini_batches; i ++) {
         int nr = std::min(queue_depth, num_chunks - i);
@@ -368,6 +386,7 @@ void GDSAsyncIO::sync_read_events()
 
 void GDSAsyncIO::synchronize(bool is_write)
 {   
+    return;
     nvtxRangePushA("synchronize");
     std::queue<Batch *> *batches = is_write ? &batches_w : &batches_r;
     while (!batches->empty()){
