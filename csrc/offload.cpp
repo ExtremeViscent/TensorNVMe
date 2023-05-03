@@ -43,6 +43,8 @@ std::unordered_set<std::string> get_backends()
 void probe_asyncio(const std::string &backend)
 {
     char* fp = tmpnam(nullptr);
+    if (backend == "gds")
+        fp = strdup("/data/gds_test.tmp");
     if (!fp)
     {
         printf("Create tmpfile error: %s\n", strerror(errno));

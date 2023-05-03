@@ -489,9 +489,9 @@ void GDSAsyncIO::readv(int fd, const iovec *iov, unsigned int iovcnt, unsigned l
 void rw_verified(){
     GDSAsyncIO *gds = new GDSAsyncIO(128);
     char *fp = tmpnam(NULL);
-    fp = "./gds_test.bin";
-    char *fp2 = "./gds_ret.bin";
-    char *fp3 = "./gds_in.bin";
+    fp = "/data/gds_test.bin";
+    char *fp2 = "/data/gds_ret.bin";
+    char *fp3 = "/data/gds_in.bin";
     int fd = open(fp, O_CREAT | O_RDWR | O_DIRECT, 0664);
     int fd2 = open(fp2, O_CREAT | O_RDWR, 0664);
     int fd3 = open(fp3, O_CREAT | O_RDWR, 0664);
